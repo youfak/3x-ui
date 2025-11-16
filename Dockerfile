@@ -3,7 +3,12 @@
 # ========================================================
 FROM golang:1.25-alpine AS builder
 WORKDIR /app
+ARG TARGETOS=linux
 ARG TARGETARCH
+ARG TARGETVARIANT
+ARG BUILDPLATFORM
+ARG BUILDOS
+ARG BUILDARCH
 
 RUN apk --no-cache --update add \
   build-base \
@@ -15,7 +20,17 @@ COPY . .
 
 ENV CGO_ENABLED=1
 ENV CGO_CFLAGS="-D_LARGEFILE64_SOURCE"
-RUN go build -ldflags "-w -s" -o build/x-ui main.go
+ENV GOOS=${TARGETOS}
+ENV GOARCH=${TARGETARCH}
+
+# 处理 ARM 架构变体并构建
+RUN if [ "$TARGETARCH" = "arm" ]; then \
+    GOARM=$(case "$TARGETVARIANT" in v6) echo 6;; v7) echo 7;; *) echo 7;; esac) && \
+    GOARM=$GOARM go build -ldflags "-w -s" -o build/x-ui main.go; \
+  else \
+    go build -ldflags "-w -s" -o build/x-ui main.go; \
+  fi
+
 RUN ./DockerInit.sh "$TARGETARCH"
 
 # ========================================================
