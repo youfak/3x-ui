@@ -24,13 +24,23 @@ fi
 
 # 创建并使用 buildx builder（如果不存在）
 BUILDER_NAME="multiarch-builder"
+
+# 检查 builder 是否存在
 if ! docker buildx inspect $BUILDER_NAME &> /dev/null; then
-    echo "创建新的 buildx builder: $BUILDER_NAME"
-    docker buildx create --name $BUILDER_NAME --use --bootstrap
+    echo "创建新的 buildx builder (docker-container driver): $BUILDER_NAME"
+    docker buildx create --name $BUILDER_NAME --driver docker-container --use
+    echo "启动 builder..."
+    docker buildx inspect --bootstrap
 else
     echo "使用现有的 buildx builder: $BUILDER_NAME"
     docker buildx use $BUILDER_NAME
+    # 确保 builder 已启动
+    docker buildx inspect --bootstrap
 fi
+
+# 验证 builder 是否支持多平台
+echo "检查 builder 支持的平台..."
+docker buildx inspect | grep -i platform || echo "警告: 无法验证平台支持"
 
 # 构建参数
 BUILD_ARGS=""
