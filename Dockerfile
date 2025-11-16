@@ -44,7 +44,10 @@ RUN apk add --no-cache --update \
   ca-certificates \
   tzdata \
   fail2ban \
-  bash
+  bash \
+  curl \
+  socat \
+  openssl
 
 COPY --from=builder /app/build/ /app/
 COPY --from=builder /app/DockerEntrypoint.sh /app/
@@ -62,6 +65,9 @@ RUN chmod +x \
   /app/DockerEntrypoint.sh \
   /app/x-ui \
   /usr/bin/x-ui
+
+# 预安装 acme.sh 用于 SSL 证书申请
+RUN curl -s https://get.acme.sh | sh || echo "acme.sh installation will be done at runtime if needed"
 
 ENV XUI_ENABLE_FAIL2BAN="true"
 EXPOSE 2053
