@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -174,6 +175,10 @@ func (t *Tgbot) Start(i18nFS embed.FS) error {
 		return err
 	}
 
+	// If Start is called again (e.g. during reload), ensure any previous long-polling
+	// loop is stopped before creating a new bot / receiver.
+	StopBot()
+
 	// Initialize hash storage to store callback queries
 	hashStorage = global.NewHashStorage(20 * time.Minute)
 
@@ -207,17 +212,21 @@ func (t *Tgbot) Start(i18nFS embed.FS) error {
 		return err
 	}
 
+	parsedAdminIds := make([]int64, 0)
 	// Parse admin IDs from comma-separated string
 	if tgBotID != "" {
 		for _, adminID := range strings.Split(tgBotID, ",") {
-			id, err := strconv.Atoi(adminID)
+			id, err := strconv.ParseInt(adminID, 10, 64)
 			if err != nil {
 				logger.Warning("Failed to parse admin ID from Telegram bot chat ID:", err)
 				return err
 			}
-			adminIds = append(adminIds, int64(id))
+			parsedAdminIds = append(parsedAdminIds, int64(id))
 		}
 	}
+	tgBotMutex.Lock()
+	adminIds = parsedAdminIds
+	tgBotMutex.Unlock()
 
 	// Get Telegram bot proxy URL
 	tgBotProxy, err := t.settingService.GetTgBotProxy()
@@ -252,54 +261,95 @@ func (t *Tgbot) Start(i18nFS embed.FS) error {
 	}
 
 	// Start receiving Telegram bot messages
-	if !isRunning {
+	tgBotMutex.Lock()
+	alreadyRunning := isRunning || botCancel != nil
+	tgBotMutex.Unlock()
+	if !alreadyRunning {
 		logger.Info("Telegram bot receiver started")
 		go t.OnReceive()
-		isRunning = true
 	}
 
 	return nil
 }
 
+// createRobustFastHTTPClient creates a fasthttp.Client with proper connection handling
+func (t *Tgbot) createRobustFastHTTPClient(proxyUrl string) *fasthttp.Client {
+	client := &fasthttp.Client{
+		// Connection timeouts
+		ReadTimeout:                   30 * time.Second,
+		WriteTimeout:                  30 * time.Second,
+		MaxIdleConnDuration:           60 * time.Second,
+		MaxConnDuration:               0, // unlimited, but controlled by MaxIdleConnDuration
+		MaxIdemponentCallAttempts:     3,
+		ReadBufferSize:                4096,
+		WriteBufferSize:               4096,
+		MaxConnsPerHost:               100,
+		MaxConnWaitTimeout:            10 * time.Second,
+		DisableHeaderNamesNormalizing: false,
+		DisablePathNormalizing:        false,
+		// Retry on connection errors
+		RetryIf: func(request *fasthttp.Request) bool {
+			// Retry on connection errors for GET requests
+			return string(request.Header.Method()) == "GET" || string(request.Header.Method()) == "POST"
+		},
+	}
+
+	// Set proxy if provided
+	if proxyUrl != "" {
+		client.Dial = fasthttpproxy.FasthttpSocksDialer(proxyUrl)
+	}
+
+	return client
+}
+
 // NewBot creates a new Telegram bot instance with optional proxy and API server settings.
 func (t *Tgbot) NewBot(token string, proxyUrl string, apiServerUrl string) (*telego.Bot, error) {
-	if proxyUrl == "" && apiServerUrl == "" {
-		return telego.NewBot(token)
-	}
-
+	// Validate proxy URL if provided
 	if proxyUrl != "" {
 		if !strings.HasPrefix(proxyUrl, "socks5://") {
-			logger.Warning("Invalid socks5 URL, using default")
-			return telego.NewBot(token)
+			logger.Warning("Invalid socks5 URL, ignoring proxy")
+			proxyUrl = "" // Clear invalid proxy
+		} else {
+			_, err := url.Parse(proxyUrl)
+			if err != nil {
+				logger.Warningf("Can't parse proxy URL, ignoring proxy: %v", err)
+				proxyUrl = ""
+			}
 		}
+	}
 
-		_, err := url.Parse(proxyUrl)
-		if err != nil {
-			logger.Warningf("Can't parse proxy URL, using default instance for tgbot: %v", err)
-			return telego.NewBot(token)
+	// Validate API server URL if provided
+	if apiServerUrl != "" {
+		if !strings.HasPrefix(apiServerUrl, "http") {
+			logger.Warning("Invalid http(s) URL for API server, using default")
+			apiServerUrl = ""
+		} else {
+			_, err := url.Parse(apiServerUrl)
+			if err != nil {
+				logger.Warningf("Can't parse API server URL, using default: %v", err)
+				apiServerUrl = ""
+			}
 		}
-
-		return telego.NewBot(token, telego.WithFastHTTPClient(&fasthttp.Client{
-			Dial: fasthttpproxy.FasthttpSocksDialer(proxyUrl),
-		}))
 	}
 
-	if !strings.HasPrefix(apiServerUrl, "http") {
-		logger.Warning("Invalid http(s) URL, using default")
-		return telego.NewBot(token)
+	// Create robust fasthttp client
+	client := t.createRobustFastHTTPClient(proxyUrl)
+
+	// Build bot options
+	var options []telego.BotOption
+	options = append(options, telego.WithFastHTTPClient(client))
+
+	if apiServerUrl != "" {
+		options = append(options, telego.WithAPIServer(apiServerUrl))
 	}
 
-	_, err := url.Parse(apiServerUrl)
-	if err != nil {
-		logger.Warningf("Can't parse API server URL, using default instance for tgbot: %v", err)
-		return telego.NewBot(token)
-	}
-
-	return telego.NewBot(token, telego.WithAPIServer(apiServerUrl))
+	return telego.NewBot(token, options...)
 }
 
 // IsRunning checks if the Telegram bot is currently running.
 func (t *Tgbot) IsRunning() bool {
+	tgBotMutex.Lock()
+	defer tgBotMutex.Unlock()
 	return isRunning
 }
 
@@ -317,34 +367,34 @@ func (t *Tgbot) SetHostname() {
 // Stop safely stops the Telegram bot's Long Polling operation.
 // This method now calls the global StopBot function and cleans up other resources.
 func (t *Tgbot) Stop() {
-	// Call the global StopBot function to gracefully shut down Long Polling
 	StopBot()
-
-	// Stop the bot handler (in case the goroutine hasn't exited yet)
-	if botHandler != nil {
-		botHandler.Stop()
-	}
 	logger.Info("Stop Telegram receiver ...")
-	isRunning = false
+	tgBotMutex.Lock()
 	adminIds = nil
+	tgBotMutex.Unlock()
 }
 
 // StopBot safely stops the Telegram bot's Long Polling operation by cancelling its context.
 // This is the global function called from main.go's signal handler and t.Stop().
 func StopBot() {
+	// Don't hold the mutex while cancelling/waiting.
 	tgBotMutex.Lock()
-	defer tgBotMutex.Unlock()
+	cancel := botCancel
+	botCancel = nil
+	handler := botHandler
+	botHandler = nil
+	isRunning = false
+	tgBotMutex.Unlock()
 
-	if botCancel != nil {
+	if handler != nil {
+		handler.Stop()
+	}
+
+	if cancel != nil {
 		logger.Info("Sending cancellation signal to Telegram bot...")
-
-		// Calling botCancel() cancels the context passed to UpdatesViaLongPolling,
-		// which stops the Long Polling operation and closes the updates channel,
-		// allowing the th.Start() goroutine to exit cleanly.
-		botCancel()
-
-		botCancel = nil
-		// Giving the goroutine a small delay to exit cleanly.
+		// Cancels the context passed to UpdatesViaLongPolling; this closes updates channel
+		// and lets botHandler.Start() exit cleanly.
+		cancel()
 		botWG.Wait()
 		logger.Info("Telegram bot successfully stopped.")
 	}
@@ -377,38 +427,40 @@ func (t *Tgbot) decodeQuery(query string) (string, error) {
 // OnReceive starts the message receiving loop for the Telegram bot.
 func (t *Tgbot) OnReceive() {
 	params := telego.GetUpdatesParams{
-		Timeout: 30, // Increased timeout to reduce API calls
+		Timeout: 20, // Reduced timeout to detect connection issues faster
 	}
-	// --- GRACEFUL SHUTDOWN FIX: Context creation ---
+	// Strict singleton: never start a second long-polling loop.
 	tgBotMutex.Lock()
-
-	// Create a context with cancellation and store the cancel function.
-	var ctx context.Context
-
-	// Check if botCancel is already set (to prevent race condition overwrite and goroutine leak)
-	if botCancel == nil {
-		ctx, botCancel = context.WithCancel(context.Background())
-	} else {
-		// If botCancel is already set, use a non-cancellable context for this redundant call.
-		// This prevents overwriting the active botCancel and causing a goroutine leak from the previous call.
-		logger.Warning("TgBot OnReceive called concurrently. Using background context for redundant call.")
-		ctx = context.Background() // <<< ИЗМЕНЕНИЕ
+	if botCancel != nil || isRunning {
+		tgBotMutex.Unlock()
+		logger.Warning("TgBot OnReceive called while already running; ignoring.")
+		return
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	botCancel = cancel
+	isRunning = true
+	// Add to WaitGroup before releasing the lock so StopBot() can't return
+	// before this receiver goroutine is accounted for.
+	botWG.Add(1)
 	tgBotMutex.Unlock()
 
-	// Get updates channel using the context.
+	// Get updates channel using the context with shorter timeout for better error recovery
 	updates, _ := bot.UpdatesViaLongPolling(ctx, &params)
-	botWG.Go(func() {
+	go func() {
+		defer botWG.Done()
+		h, _ := th.NewBotHandler(bot, updates)
+		tgBotMutex.Lock()
+		botHandler = h
+		tgBotMutex.Unlock()
 
-		botHandler, _ = th.NewBotHandler(bot, updates)
-		botHandler.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
 			delete(userStates, message.Chat.ID)
 			t.SendMsgToTgbot(message.Chat.ID, t.I18nBot("tgbot.keyboardClosed"), tu.ReplyKeyboardRemove())
 			return nil
 		}, th.TextEqual(t.I18nBot("tgbot.buttons.closeKeyboard")))
 
-		botHandler.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
 			// Use goroutine with worker pool for concurrent command processing
 			go func() {
 				messageWorkerPool <- struct{}{}        // Acquire worker
@@ -420,7 +472,7 @@ func (t *Tgbot) OnReceive() {
 			return nil
 		}, th.AnyCommand())
 
-		botHandler.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
+		h.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
 			// Use goroutine with worker pool for concurrent callback processing
 			go func() {
 				messageWorkerPool <- struct{}{}        // Acquire worker
@@ -432,7 +484,7 @@ func (t *Tgbot) OnReceive() {
 			return nil
 		}, th.AnyCallbackQueryWithMessage())
 
-		botHandler.HandleMessage(func(ctx *th.Context, message telego.Message) error {
+		h.HandleMessage(func(ctx *th.Context, message telego.Message) error {
 			if userState, exists := userStates[message.Chat.ID]; exists {
 				switch userState {
 				case "awaiting_id":
@@ -578,8 +630,8 @@ func (t *Tgbot) OnReceive() {
 			return nil
 		}, th.AnyMessage())
 
-		botHandler.Start()
-	})
+		h.Start()
+	}()
 }
 
 // answerCommand processes incoming command messages from Telegram users.
@@ -905,8 +957,8 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.sendCallbackAnswerTgBot(callbackQuery.ID, t.I18nBot("tgbot.answers.errorOperation"))
 				t.searchClient(chatId, email, callbackQuery.Message.GetMessageID())
 			case "add_client_limit_traffic_c":
-				limitTraffic, _ := strconv.Atoi(dataArray[1])
-				client_TotalGB = int64(limitTraffic) * 1024 * 1024 * 1024
+				limitTraffic, _ := strconv.ParseInt(dataArray[1], 10, 64)
+				client_TotalGB = limitTraffic * 1024 * 1024 * 1024
 				messageId := callbackQuery.Message.GetMessageID()
 				inbound, err := t.inboundService.GetInbound(receiver_inbound_ID)
 				if err != nil {
@@ -1010,7 +1062,7 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.editMessageCallbackTgBot(chatId, callbackQuery.Message.GetMessageID(), inlineKeyboard)
 			case "reset_exp_c":
 				if len(dataArray) == 3 {
-					days, err := strconv.Atoi(dataArray[2])
+					days, err := strconv.ParseInt(dataArray[2], 10, 64)
 					if err == nil {
 						var date int64
 						if days > 0 {
@@ -1115,7 +1167,7 @@ func (t *Tgbot) answerCallback(callbackQuery *telego.CallbackQuery, isAdmin bool
 				t.searchClient(chatId, email, callbackQuery.Message.GetMessageID())
 			case "add_client_reset_exp_c":
 				client_ExpiryTime = 0
-				days, _ := strconv.Atoi(dataArray[1])
+				days, _ := strconv.ParseInt(dataArray[1], 10, 64)
 				var date int64
 				if client_ExpiryTime > 0 {
 					if client_ExpiryTime-time.Now().Unix()*1000 < 0 {
@@ -2232,10 +2284,36 @@ func (t *Tgbot) SendMsgToTgbot(chatId int64, msg string, replyMarkup ...telego.R
 		if len(replyMarkup) > 0 && n == (len(allMessages)-1) {
 			params.ReplyMarkup = replyMarkup[0]
 		}
-		_, err := bot.SendMessage(context.Background(), &params)
-		if err != nil {
-			logger.Warning("Error sending telegram message :", err)
+
+		// Retry logic with exponential backoff for connection errors
+		maxRetries := 3
+		for attempt := range maxRetries {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, err := bot.SendMessage(ctx, &params)
+			cancel()
+
+			if err == nil {
+				break // Success
+			}
+
+			// Check if error is a connection error
+			errStr := err.Error()
+			isConnectionError := strings.Contains(errStr, "connection") ||
+				strings.Contains(errStr, "timeout") ||
+				strings.Contains(errStr, "closed")
+
+			if isConnectionError && attempt < maxRetries-1 {
+				// Exponential backoff: 1s, 2s, 4s
+				backoff := time.Duration(1<<uint(attempt)) * time.Second
+				logger.Warningf("Connection error sending telegram message (attempt %d/%d), retrying in %v: %v",
+					attempt+1, maxRetries, backoff, err)
+				time.Sleep(backoff)
+			} else {
+				logger.Warning("Error sending telegram message:", err)
+				break
+			}
 		}
+
 		// Reduced delay to improve performance (only needed for rate limiting)
 		if n < len(allMessages)-1 { // Only delay between messages, not after the last one
 			time.Sleep(100 * time.Millisecond)
@@ -2253,6 +2331,8 @@ func (t *Tgbot) buildSubscriptionURLs(email string) (string, string, error) {
 	}
 
 	// Gather settings to construct absolute URLs
+	subURI, _ := t.settingService.GetSubURI()
+	subJsonURI, _ := t.settingService.GetSubJsonURI()
 	subDomain, _ := t.settingService.GetSubDomain()
 	subPort, _ := t.settingService.GetSubPort()
 	subPath, _ := t.settingService.GetSubPath()
@@ -2300,8 +2380,29 @@ func (t *Tgbot) buildSubscriptionURLs(email string) (string, string, error) {
 		subJsonPath = subJsonPath + "/"
 	}
 
-	subURL := fmt.Sprintf("%s://%s%s%s", scheme, host, subPath, client.SubID)
-	subJsonURL := fmt.Sprintf("%s://%s%s%s", scheme, host, subJsonPath, client.SubID)
+	var subURL string
+	var subJsonURL string
+
+	// If pre-configured URIs are available, use them directly
+	if subURI != "" {
+		if !strings.HasSuffix(subURI, "/") {
+			subURI = subURI + "/"
+		}
+		subURL = fmt.Sprintf("%s%s", subURI, client.SubID)
+	} else {
+		subURL = fmt.Sprintf("%s://%s%s%s", scheme, host, subPath, client.SubID)
+	}
+
+	if subJsonURI != "" {
+		if !strings.HasSuffix(subJsonURI, "/") {
+			subJsonURI = subJsonURI + "/"
+		}
+		subJsonURL = fmt.Sprintf("%s%s", subJsonURI, client.SubID)
+	} else {
+
+		subJsonURL = fmt.Sprintf("%s://%s%s%s", scheme, host, subJsonPath, client.SubID)
+	}
+
 	if !subJsonEnable {
 		subJsonURL = ""
 	}
@@ -2547,8 +2648,12 @@ func (t *Tgbot) SendBackupToAdmins() {
 	if !t.IsRunning() {
 		return
 	}
-	for _, adminId := range adminIds {
+	for i, adminId := range adminIds {
 		t.sendBackup(int64(adminId))
+		// Add delay between sends to avoid Telegram rate limits
+		if i < len(adminIds)-1 {
+			time.Sleep(1 * time.Second)
+		}
 	}
 }
 
@@ -2952,10 +3057,12 @@ func (t *Tgbot) clientInfoMsg(
 	}
 
 	status := t.I18nBot("tgbot.offline")
+	isOnline := false
 	if p.IsRunning() {
 		for _, online := range p.GetOnlineClients() {
 			if online == traffic.Email {
 				status = t.I18nBot("tgbot.online")
+				isOnline = true
 				break
 			}
 		}
@@ -2968,6 +3075,9 @@ func (t *Tgbot) clientInfoMsg(
 	}
 	if printOnline {
 		output += t.I18nBot("tgbot.messages.online", "Status=="+status)
+		if !isOnline && traffic.LastOnline > 0 {
+			output += t.I18nBot("tgbot.messages.lastOnline", "Time=="+time.UnixMilli(traffic.LastOnline).Format("2006-01-02 15:04:05"))
+		}
 	}
 	if printActive {
 		output += t.I18nBot("tgbot.messages.active", "Enable=="+active)
@@ -3041,9 +3151,41 @@ func (t *Tgbot) searchClientIps(chatId int64, email string, messageID ...int) {
 		ips = t.I18nBot("tgbot.noIpRecord")
 	}
 
+	formattedIps := ips
+	if err == nil && len(ips) > 0 {
+		type ipWithTimestamp struct {
+			IP        string `json:"ip"`
+			Timestamp int64  `json:"timestamp"`
+		}
+
+		var ipsWithTime []ipWithTimestamp
+		if json.Unmarshal([]byte(ips), &ipsWithTime) == nil && len(ipsWithTime) > 0 {
+			lines := make([]string, 0, len(ipsWithTime))
+			for _, item := range ipsWithTime {
+				if item.IP == "" {
+					continue
+				}
+				if item.Timestamp > 0 {
+					ts := time.Unix(item.Timestamp, 0).Format("2006-01-02 15:04:05")
+					lines = append(lines, fmt.Sprintf("%s (%s)", item.IP, ts))
+					continue
+				}
+				lines = append(lines, item.IP)
+			}
+			if len(lines) > 0 {
+				formattedIps = strings.Join(lines, "\n")
+			}
+		} else {
+			var oldIps []string
+			if json.Unmarshal([]byte(ips), &oldIps) == nil && len(oldIps) > 0 {
+				formattedIps = strings.Join(oldIps, "\n")
+			}
+		}
+	}
+
 	output := ""
 	output += t.I18nBot("tgbot.messages.email", "Email=="+email)
-	output += t.I18nBot("tgbot.messages.ips", "IPs=="+ips)
+	output += t.I18nBot("tgbot.messages.ips", "IPs=="+formattedIps)
 	output += t.I18nBot("tgbot.messages.refreshedOn", "Time=="+time.Now().Format("2006-01-02 15:04:05"))
 
 	inlineKeyboard := tu.InlineKeyboard(
@@ -3521,13 +3663,17 @@ func (t *Tgbot) sendBackup(chatId int64) {
 		logger.Error("Error in trigger a checkpoint operation: ", err)
 	}
 
+	// Send database backup
 	file, err := os.Open(config.GetDBPath())
 	if err == nil {
+		defer file.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		document := tu.Document(
 			tu.ID(chatId),
 			tu.File(file),
 		)
-		_, err = bot.SendDocument(context.Background(), document)
+		_, err = bot.SendDocument(ctx, document)
 		if err != nil {
 			logger.Error("Error in uploading backup: ", err)
 		}
@@ -3535,13 +3681,20 @@ func (t *Tgbot) sendBackup(chatId int64) {
 		logger.Error("Error in opening db file for backup: ", err)
 	}
 
+	// Small delay between file sends
+	time.Sleep(500 * time.Millisecond)
+
+	// Send config.json backup
 	file, err = os.Open(xray.GetConfigPath())
 	if err == nil {
+		defer file.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		document := tu.Document(
 			tu.ID(chatId),
 			tu.File(file),
 		)
-		_, err = bot.SendDocument(context.Background(), document)
+		_, err = bot.SendDocument(ctx, document)
 		if err != nil {
 			logger.Error("Error in uploading config.json: ", err)
 		}

@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
 	"github.com/mhsanaei/3x-ui/v2/web/service"
 	"github.com/mhsanaei/3x-ui/v2/web/session"
+	"github.com/mhsanaei/3x-ui/v2/web/websocket"
 
 	"github.com/gin-gonic/gin"
 )
@@ -125,6 +127,9 @@ func (a *InboundController) addInbound(c *gin.Context) {
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	// Broadcast inbounds update via WebSocket
+	inbounds, _ := a.inboundService.GetInbounds(user.Id)
+	websocket.BroadcastInbounds(inbounds)
 }
 
 // delInbound deletes an inbound configuration by its ID.
@@ -143,6 +148,10 @@ func (a *InboundController) delInbound(c *gin.Context) {
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	// Broadcast inbounds update via WebSocket
+	user := session.GetLoginUser(c)
+	inbounds, _ := a.inboundService.GetInbounds(user.Id)
+	websocket.BroadcastInbounds(inbounds)
 }
 
 // updateInbound updates an existing inbound configuration.
@@ -169,6 +178,10 @@ func (a *InboundController) updateInbound(c *gin.Context) {
 	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
+	// Broadcast inbounds update via WebSocket
+	user := session.GetLoginUser(c)
+	inbounds, _ := a.inboundService.GetInbounds(user.Id)
+	websocket.BroadcastInbounds(inbounds)
 }
 
 // getClientIps retrieves the IP addresses associated with a client by email.
@@ -181,6 +194,37 @@ func (a *InboundController) getClientIps(c *gin.Context) {
 		return
 	}
 
+	// Prefer returning a normalized string list for consistent UI rendering
+	type ipWithTimestamp struct {
+		IP        string `json:"ip"`
+		Timestamp int64  `json:"timestamp"`
+	}
+
+	var ipsWithTime []ipWithTimestamp
+	if err := json.Unmarshal([]byte(ips), &ipsWithTime); err == nil && len(ipsWithTime) > 0 {
+		formatted := make([]string, 0, len(ipsWithTime))
+		for _, item := range ipsWithTime {
+			if item.IP == "" {
+				continue
+			}
+			if item.Timestamp > 0 {
+				ts := time.Unix(item.Timestamp, 0).Local().Format("2006-01-02 15:04:05")
+				formatted = append(formatted, fmt.Sprintf("%s (%s)", item.IP, ts))
+				continue
+			}
+			formatted = append(formatted, item.IP)
+		}
+		jsonObj(c, formatted, nil)
+		return
+	}
+
+	var oldIps []string
+	if err := json.Unmarshal([]byte(ips), &oldIps); err == nil && len(oldIps) > 0 {
+		jsonObj(c, oldIps, nil)
+		return
+	}
+
+	// If parsing fails, return as string
 	jsonObj(c, ips, nil)
 }
 

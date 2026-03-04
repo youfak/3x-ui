@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/database/model"
@@ -197,9 +198,8 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 
 		newOutbounds = append(newOutbounds, s.defaultOutbounds...)
 		newConfigJson := make(map[string]any)
-		for key, value := range s.configJson {
-			newConfigJson[key] = value
-		}
+		maps.Copy(newConfigJson, s.configJson)
+
 		newConfigJson["outbounds"] = newOutbounds
 		newConfigJson["remarks"] = s.SubService.genRemark(inbound, client.Email, extPrxy["remark"].(string))
 
@@ -253,9 +253,6 @@ func (s *SubJsonService) tlsData(tData map[string]any) map[string]any {
 
 	tlsData["serverName"] = tData["serverName"]
 	tlsData["alpn"] = tData["alpn"]
-	if allowInsecure, ok := tlsClientSettings["allowInsecure"].(bool); ok {
-		tlsData["allowInsecure"] = allowInsecure
-	}
 	if fingerprint, ok := tlsClientSettings["fingerprint"].(string); ok {
 		tlsData["fingerprint"] = fingerprint
 	}
