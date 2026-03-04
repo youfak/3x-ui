@@ -2,6 +2,9 @@
 
 # Docker Buildx 多平台构建脚本
 # 支持构建多个架构的 Docker 镜像
+# docker run --privileged --rm tonistiigi/binfmt --install all
+# docker buildx inspect --bootstrap
+# 使用示例: docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t  3x-ui .
 
 set -e
 
